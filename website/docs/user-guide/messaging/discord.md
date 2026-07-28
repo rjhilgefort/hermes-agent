@@ -298,6 +298,7 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_COMMAND_SYNC_POLICY` | No | `"safe"` | Controls native slash-command startup sync. `"safe"` diffs existing global commands and only updates what changed, recreating commands when Discord metadata changes cannot be applied via patch. `"bulk"` preserves the old `tree.sync()` behavior. `"off"` skips startup sync entirely. |
 | `DISCORD_REQUIRE_MENTION` | No | `true` | When `true`, the bot only responds in server channels when `@mentioned`. Set to `false` to respond to all messages in every channel. |
 | `DISCORD_THREAD_REQUIRE_MENTION` | No | `false` | When `true`, the in-thread mention shortcut is disabled — threads are gated the same as channels, requiring `@mention` even after the bot has already participated. Use this when multiple bots share a thread and you want each to fire only on explicit `@mention`. |
+| `DISCORD_THREAD_MENTION_FREE_USERS` | No | — | Comma-separated user IDs allowed mention-free follow-ups in bot-participated threads. Once any other human posts in one of those threads, the thread permanently requires `@mention` for everyone. Bot-authored messages do not change the thread mode. |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds without requiring an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `true`. |
 | `DISCORD_IGNORE_NO_MENTION` | No | `true` | When `true`, the bot stays silent if a message `@mentions` other users but does **not** mention the bot. Prevents the bot from jumping into conversations directed at other people. Only applies in server channels, not DMs. |
 | `DISCORD_AUTO_THREAD` | No | `true` | When `true`, automatically creates a new thread for every `@mention` in a text channel, so each conversation is isolated (similar to Slack behavior). Messages already inside threads or DMs are unaffected. |
@@ -334,6 +335,7 @@ The `discord` section in `~/.hermes/config.yaml` mirrors the env vars above. Con
 discord:
   require_mention: true           # Require @mention in server channels
   thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
+  thread_mention_free_users: []   # User IDs allowed one-on-one mention-free threads
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
   reactions: true                 # Add emoji reactions during processing
@@ -376,6 +378,28 @@ In **multi-bot threads** where users address one bot per turn, this default beco
 discord:
   require_mention: true
   thread_require_mention: true    # multi-bot setup
+```
+
+#### `discord.thread_mention_free_users`
+
+**Type:** string or list — **Default:** `[]`
+
+Limits the bot-participated thread shortcut to selected users. A configured
+user can continue a one-on-one thread without tagging the bot. When any other
+human posts in that thread, Hermes records the thread as shared and requires an
+explicit `@mention` from everyone from then on. Bot-authored messages do not
+make a thread shared.
+
+This policy is based on observed messages, not Discord's public-thread member
+list. Merely viewing or joining a public thread does not change its mode; the
+first message from another human does, and that first unmentioned message is
+ignored.
+
+```yaml
+discord:
+  require_mention: true
+  thread_mention_free_users:
+    - "284102345871466496"
 ```
 
 #### `discord.free_response_channels`

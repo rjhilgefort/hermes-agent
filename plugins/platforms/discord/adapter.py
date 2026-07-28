@@ -919,6 +919,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
+        # Threads where a human outside ``thread_mention_free_users`` has
+        # participated. These become permanently mention-gated so a thread can
+        # start as a one-on-one conversation without staying ambient once
+        # another person joins the discussion.
+        self._shared_human_threads = ThreadParticipationTracker("discord-shared-human")
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -1369,6 +1374,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 pass
+        # Observe human participation before authorization drops the message.
+        # An unallowlisted human joining a one-on-one thread should still make
+        # that visible thread mention-gated for future allowed-user messages.
+        self._observe_thread_human_participant(message)
         admitted, role_authorized = self._discord_message_admission(
             message, claim=True,
         )
@@ -2164,8 +2173,10 @@ class DiscordAdapter(BasePlatformAdapter):
             free_channels = self._discord_free_response_channels()
             in_bot_thread = (
                 isinstance(message.channel, discord.Thread)
-                and str(message.channel.id) in self._threads
-                and not self._discord_thread_require_mention()
+                and self._discord_bot_thread_is_mention_free(
+                    message,
+                    str(message.channel.id),
+                )
             )
             if (
                 self._discord_require_mention()
@@ -5895,6 +5906,66 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _discord_thread_mention_free_users(self) -> set[str]:
+        """Return human user IDs allowed mention-free one-on-one threads.
+
+        An empty set preserves the legacy behavior where every bot-participated
+        thread is mention-free. Configuring one or more IDs enables the stricter
+        single-human policy for those users.
+        """
+        configured = self.config.extra.get("thread_mention_free_users")
+        if configured is None:
+            configured = os.getenv("DISCORD_THREAD_MENTION_FREE_USERS", "")
+        if isinstance(configured, (list, tuple, set)):
+            return {str(value).strip() for value in configured if str(value).strip()}
+        return {
+            value.strip()
+            for value in str(configured or "").split(",")
+            if value.strip()
+        }
+
+    def _observe_thread_human_participant(self, message: Any) -> None:
+        """Permanently mark a configured one-on-one thread as shared."""
+        mention_free_users = self._discord_thread_mention_free_users()
+        if (
+            not mention_free_users
+            or discord is None
+            or not isinstance(message.channel, discord.Thread)
+        ):
+            return
+        thread_id = str(message.channel.id)
+        if thread_id not in self._threads:
+            return
+        author = getattr(message, "author", None)
+        if author is None or getattr(author, "bot", False):
+            return
+        if str(getattr(author, "id", "")) not in mention_free_users:
+            self._shared_human_threads.mark(thread_id)
+
+    def _discord_bot_thread_is_mention_free(
+        self,
+        message: Any,
+        thread_id: str | None,
+    ) -> bool:
+        """Return whether prior bot participation waives this message's mention."""
+        if (
+            not thread_id
+            or thread_id not in self._threads
+            or self._discord_thread_require_mention()
+        ):
+            return False
+
+        mention_free_users = self._discord_thread_mention_free_users()
+        if not mention_free_users:
+            return True
+
+        self._observe_thread_human_participant(message)
+        author_id = str(getattr(getattr(message, "author", None), "id", ""))
+        return (
+            author_id in mention_free_users
+            and thread_id not in self._shared_human_threads
+        )
+
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
         configured = self.config.extra.get("history_backfill")
@@ -7197,10 +7268,9 @@ class DiscordAdapter(BasePlatformAdapter):
             # — UNLESS thread_require_mention is enabled, in which case threads
             # are gated the same as channels.  Useful when multiple bots share
             # a thread.
-            in_bot_thread = (
-                is_thread
-                and thread_id in self._threads
-                and not self._discord_thread_require_mention()
+            in_bot_thread = is_thread and self._discord_bot_thread_is_mention_free(
+                message,
+                thread_id,
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
@@ -9374,6 +9444,11 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
     if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
         os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
+    thread_users = discord_cfg.get("thread_mention_free_users")
+    if thread_users is not None and not os.getenv("DISCORD_THREAD_MENTION_FREE_USERS"):
+        if isinstance(thread_users, list):
+            thread_users = ",".join(str(value) for value in thread_users)
+        os.environ["DISCORD_THREAD_MENTION_FREE_USERS"] = str(thread_users)
     if "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
         os.environ["DISCORD_BOTS_REQUIRE_INLINE_MENTION"] = str(discord_cfg["bots_require_inline_mention"]).lower()
     platforms_cfg = yaml_cfg.get("platforms")
