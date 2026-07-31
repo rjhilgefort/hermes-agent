@@ -134,6 +134,7 @@ def make_message(
     channel,
     content: str,
     mentions=None,
+    role_mentions=None,
     msg_type=None,
     author_id: int = 42,
     author_bot: bool = False,
@@ -148,6 +149,7 @@ def make_message(
         id=123,
         content=content,
         mentions=list(mentions or []),
+        role_mentions=list(role_mentions or []),
         attachments=[],
         reference=None,
         created_at=datetime.now(timezone.utc),
@@ -391,6 +393,56 @@ async def test_discord_accepts_raw_bot_mentions_when_required(adapter, monkeypat
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "hello from raw mention"
+
+
+@pytest.mark.asyncio
+async def test_discord_accepts_and_strips_own_managed_role_mention_when_required(adapter, monkeypatch):
+    """The bot's Discord-managed role should address the bot like its user mention."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    bot_role = SimpleNamespace(
+        id=555,
+        managed=True,
+        tags=SimpleNamespace(bot_id=adapter._client.user.id),
+    )
+    message = make_message(
+        channel=FakeTextChannel(channel_id=325),
+        content=f"<@&{bot_role.id}> hello from role mention",
+        mentions=[],
+        role_mentions=[bot_role],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello from role mention"
+
+
+@pytest.mark.asyncio
+async def test_discord_rejects_other_managed_role_mention_when_required(adapter, monkeypatch):
+    """A role owned by another bot must not address this bot."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    other_bot_role = SimpleNamespace(
+        id=556,
+        managed=True,
+        tags=SimpleNamespace(bot_id=12345),
+    )
+    message = make_message(
+        channel=FakeTextChannel(channel_id=326),
+        content=f"<@&{other_bot_role.id}> hello other role",
+        mentions=[],
+        role_mentions=[other_bot_role],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
