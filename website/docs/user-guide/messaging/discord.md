@@ -312,6 +312,7 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_NO_THREAD_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds directly in the channel instead of creating a thread. Only relevant when `DISCORD_AUTO_THREAD` is `true`. |
 | `DISCORD_HISTORY_BACKFILL` | No | `true` | When `true`, prepend recent channel scrollback (since the bot's last response) to the user message when the bot is mentioned. Recovers context the bot would otherwise miss with `require_mention`. Skipped in DMs and free-response channels. Set to `false` to disable. |
 | `DISCORD_HISTORY_BACKFILL_LIMIT` | No | `50` | Maximum number of messages to scan backwards when assembling the backfill block. In practice the scan usually stops earlier — at the bot's own last message in the channel. |
+| `DISCORD_DYNAMIC_THREAD_HISTORY_LIMIT` | No | `5000` | Maximum messages scanned after a cold start to recover trusted-peer participation in a thread. This is intentionally separate from the smaller conversational backfill limit. If saturated, the thread fails closed to explicit addressing. |
 | `DISCORD_REPLY_TO_MODE` | No | `"first"` | Controls reply-reference behavior: `"off"` — never reply to the original message, `"first"` — reply-reference on the first message chunk only (default), `"all"` — reply-reference on every chunk. |
 | `DISCORD_ALLOW_MENTION_EVERYONE` | No | `false` | When `false` (default), the bot cannot ping `@everyone` or `@here` even if its response contains those tokens. Set to `true` to opt back in. See [Mention Control](#mention-control) below. |
 | `DISCORD_ALLOW_MENTION_ROLES` | No | `false` | When `false` (default), the bot cannot ping `@role` mentions. Set to `true` to allow. |
@@ -338,6 +339,7 @@ discord:
   thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
   thread_mention_free_users: []   # User IDs allowed one-on-one mention-free threads
   dynamic_thread_mentions: false # Solo ambient follow-ups; explicit addressing after a trusted peer joins
+  dynamic_thread_history_limit: 5000 # Bounded cold-start trusted-peer scan; saturation fails closed
   peer_bot_ids: []                # Trusted Discord bot user IDs
   allow_bots: none                # Set to mentions for trusted visible bot handoffs
   bots_require_inline_mention: false # Require literal inline mentions from bot authors

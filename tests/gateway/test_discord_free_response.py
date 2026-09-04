@@ -122,6 +122,7 @@ def adapter(monkeypatch):
         "DISCORD_ALLOW_ALL_USERS",
         "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
         "DISCORD_DYNAMIC_THREAD_MENTIONS",
+        "DISCORD_DYNAMIC_THREAD_HISTORY_LIMIT",
         "DISCORD_PEER_BOT_IDS",
     ):
         monkeypatch.delenv(_var, raising=False)
@@ -1142,11 +1143,12 @@ async def test_recovered_multi_agent_thread_routes_direct_reply(adapter, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_dynamic_history_truncated_page_fails_closed(adapter, monkeypatch):
+async def test_dynamic_history_uses_peer_scan_limit_not_context_limit(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     _enable_dynamic(adapter)
     adapter.config.extra["history_backfill_limit"] = 2
+    adapter.config.extra["dynamic_thread_history_limit"] = 3
     human = SimpleNamespace(id=42, bot=False, display_name="Rob", name="Rob")
     thread = FakeHistoryThread(
         [
@@ -1159,7 +1161,29 @@ async def test_dynamic_history_truncated_page_fails_closed(adapter, monkeypatch)
 
     await adapter._handle_message(make_message(channel=thread, content="ambient"))
 
-    assert "2018" in adapter._multi_agent_threads
+    assert "2018" not in adapter._multi_agent_threads
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_history_truncated_peer_scan_fails_closed(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    _enable_dynamic(adapter)
+    adapter.config.extra["dynamic_thread_history_limit"] = 2
+    human = SimpleNamespace(id=42, bot=False, display_name="Rob", name="Rob")
+    thread = FakeHistoryThread(
+        [
+            make_history_message(author=human, content="recent one", msg_id=122),
+            make_history_message(author=human, content="recent two", msg_id=121),
+        ],
+        channel_id=2020,
+    )
+    adapter._threads.mark("2020")
+
+    await adapter._handle_message(make_message(channel=thread, content="ambient"))
+
+    assert "2020" in adapter._multi_agent_threads
     adapter.handle_message.assert_not_awaited()
 
 
@@ -1314,6 +1338,7 @@ def test_dynamic_yaml_bridge_and_peer_id_normalization(adapter, monkeypatch):
         "DISCORD_ALLOW_BOTS",
         "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
         "DISCORD_DYNAMIC_THREAD_MENTIONS",
+        "DISCORD_DYNAMIC_THREAD_HISTORY_LIMIT",
         "DISCORD_PEER_BOT_IDS",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -1323,6 +1348,7 @@ def test_dynamic_yaml_bridge_and_peer_id_normalization(adapter, monkeypatch):
             "allow_bots": "mentions",
             "bots_require_inline_mention": True,
             "dynamic_thread_mentions": True,
+            "dynamic_thread_history_limit": 321,
             "peer_bot_ids": ["111", "<@222>", "user:333", "not-a-name"],
         },
     )
@@ -1331,6 +1357,7 @@ def test_dynamic_yaml_bridge_and_peer_id_normalization(adapter, monkeypatch):
     assert adapter._get_allow_bots() == "mentions"
     assert adapter._discord_bots_require_inline_mention() is True
     assert adapter._discord_dynamic_thread_mentions() is True
+    assert adapter._discord_dynamic_thread_history_limit() == 321
     assert adapter._discord_peer_bot_ids() == {"111", "222", "333"}
 
 
@@ -1338,6 +1365,7 @@ def test_dynamic_yaml_bridge_preserves_environment_precedence(adapter, monkeypat
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "mentions")
     monkeypatch.setenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "true")
     monkeypatch.setenv("DISCORD_DYNAMIC_THREAD_MENTIONS", "true")
+    monkeypatch.setenv("DISCORD_DYNAMIC_THREAD_HISTORY_LIMIT", "654")
     monkeypatch.setenv("DISCORD_PEER_BOT_IDS", "222")
 
     seeded = _apply_yaml_config(
@@ -1346,6 +1374,7 @@ def test_dynamic_yaml_bridge_preserves_environment_precedence(adapter, monkeypat
             "allow_bots": "none",
             "bots_require_inline_mention": False,
             "dynamic_thread_mentions": False,
+            "dynamic_thread_history_limit": 321,
             "peer_bot_ids": ["111"],
         },
     )
@@ -1354,6 +1383,7 @@ def test_dynamic_yaml_bridge_preserves_environment_precedence(adapter, monkeypat
     assert adapter._get_allow_bots() == "mentions"
     assert adapter._discord_bots_require_inline_mention() is True
     assert adapter._discord_dynamic_thread_mentions() is True
+    assert adapter._discord_dynamic_thread_history_limit() == 654
     assert adapter._discord_peer_bot_ids() == {"222"}
 
 

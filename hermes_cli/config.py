@@ -2620,6 +2620,7 @@ DEFAULT_CONFIG = {
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
         "dynamic_thread_mentions": False,  # Solo bot gets ambient follow-ups; trusted peer participation switches the thread to explicit addressing
+        "dynamic_thread_history_limit": 5000,  # Bounded cold-start scan for trusted peer participation; saturation fails closed
         "peer_bot_ids": [],              # Discord bot user IDs trusted for visible bot-to-bot handoffs
         "allow_bots": "none",           # none | mentions | all; use mentions for trusted visible bot handoffs
         "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.

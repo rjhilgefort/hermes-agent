@@ -5992,7 +5992,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
             self._dynamic_thread_history_checked.add(thread_id)
             try:
-                scan_limit = self._discord_history_backfill_limit()
+                scan_limit = self._discord_dynamic_thread_history_limit()
                 scanned = 0
                 history = message.channel.history(
                     limit=scan_limit,
@@ -6194,6 +6194,26 @@ class DiscordAdapter(BasePlatformAdapter):
             return int(raw)
         except (ValueError, TypeError):
             return 50
+
+    def _discord_dynamic_thread_history_limit(self) -> int:
+        """Return the bounded cold-start scan limit for trusted peer evidence.
+
+        Peer recovery must not reuse the much smaller conversational-context
+        backfill limit. Long-running solo threads routinely exceed that limit;
+        treating an ordinary context cap as incomplete peer evidence would
+        permanently and incorrectly make them mention-only after a restart.
+        """
+        configured = self.config.extra.get("dynamic_thread_history_limit")
+        if configured is not None:
+            try:
+                return int(configured)
+            except (ValueError, TypeError):
+                pass
+        raw = os.getenv("DISCORD_DYNAMIC_THREAD_HISTORY_LIMIT", "5000")
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            return 5000
 
     async def _fetch_channel_context(
         self,
@@ -9651,7 +9671,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
     ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``,
-    ``DISCORD_BOTS_REQUIRE_INLINE_MENTION``).
+    ``DISCORD_BOTS_REQUIRE_INLINE_MENTION``,
+    ``DISCORD_DYNAMIC_THREAD_HISTORY_LIMIT``).
     Rather than rewrite ~50 call sites inside the adapter to read from
     ``PlatformConfig.extra`` instead, this hook keeps the existing
     env-driven model and merely owns the YAML→env translation here, next to
@@ -9697,6 +9718,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     for key, env_key in (
         ("bots_require_inline_mention", "DISCORD_BOTS_REQUIRE_INLINE_MENTION"),
         ("dynamic_thread_mentions", "DISCORD_DYNAMIC_THREAD_MENTIONS"),
+        ("dynamic_thread_history_limit", "DISCORD_DYNAMIC_THREAD_HISTORY_LIMIT"),
     ):
         value = discord_cfg[key] if key in discord_cfg else platform_extra_cfg.get(key)
         if value is not None:
