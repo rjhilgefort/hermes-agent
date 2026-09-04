@@ -1009,6 +1009,7 @@ def test_dynamic_mode_with_empty_allowlist_rejects_all_bots(adapter):
 
 def test_trusted_bot_requires_literal_inline_mention(adapter):
     _enable_dynamic(adapter)
+    adapter.config.extra["allow_bots"] = "none"
     message = make_message(
         channel=FakeThread(channel_id=2006),
         content="reply chip only",
@@ -1021,6 +1022,28 @@ def test_trusted_bot_requires_literal_inline_mention(adapter):
 
     assert admitted is False
     assert "2006" in adapter._multi_agent_threads
+
+
+def test_explicitly_mentioned_trusted_peer_bypasses_global_bot_block(adapter):
+    _enable_dynamic(adapter)
+    adapter.config.extra["allow_bots"] = "none"
+    bot_user = adapter._client.user
+    bot_user.bot = True
+    message = make_message(
+        channel=FakeThread(channel_id=2010),
+        content=f"<@{bot_user.id}> execute the handoff",
+        mentions=[bot_user],
+        author_id=111,
+        author_bot=True,
+    )
+
+    admitted, adapter_authorized = adapter._discord_message_admission(
+        message, claim=False,
+    )
+
+    assert admitted is True
+    assert adapter_authorized is True
+    assert "2010" in adapter._multi_agent_threads
 
 
 @pytest.mark.asyncio

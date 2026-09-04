@@ -300,12 +300,12 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_THREAD_REQUIRE_MENTION` | No | `false` | When `true`, the in-thread mention shortcut is disabled — threads are gated the same as channels, requiring `@mention` even after the bot has already participated. Use this when multiple bots share a thread and you want each to fire only on explicit `@mention`. |
 | `DISCORD_THREAD_MENTION_FREE_USERS` | No | — | Comma-separated user IDs allowed mention-free follow-ups in bot-participated threads. Once any other human posts in one of those threads, the thread permanently requires `@mention` for everyone. Bot-authored messages do not change the thread mode. |
 | `DISCORD_DYNAMIC_THREAD_MENTIONS` | No | `false` | A solo bot gets ambient thread follow-ups until a configured peer bot is mentioned or speaks; then the thread permanently requires explicit addressing. |
-| `DISCORD_PEER_BOT_IDS` | No | — | Comma-separated Discord bot user IDs trusted for visible handoffs. Other bot IDs are rejected even if they mention this bot. |
+| `DISCORD_PEER_BOT_IDS` | No | — | Comma-separated Discord bot user IDs trusted for visible handoffs. A listed peer may bypass `DISCORD_ALLOW_BOTS=none` only by including this bot's literal user mention. Other bot IDs are rejected even if they mention this bot. |
 | `DISCORD_BOTS_REQUIRE_INLINE_MENTION` | No | `false` | Require bot-authored input to contain a literal inline mention of this bot. Discord reply pings do not count. |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds without requiring an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `true`. |
 | `DISCORD_IGNORE_NO_MENTION` | No | `true` | When `true`, the bot stays silent if a message `@mentions` other users but does **not** mention the bot. Prevents the bot from jumping into conversations directed at other people. Only applies in server channels, not DMs. |
 | `DISCORD_AUTO_THREAD` | No | `true` | When `true`, automatically creates a new thread for every `@mention` in a text channel, so each conversation is isolated (similar to Slack behavior). Messages already inside threads or DMs are unaffected. |
-| `DISCORD_ALLOW_BOTS` | No | `"none"` | Controls how the bot handles messages from other Discord bots. `"none"` — ignore all other bots. `"mentions"` — only accept bot messages that `@mention` Hermes. `"all"` — accept all bot messages. |
+| `DISCORD_ALLOW_BOTS` | No | `"none"` | Controls broad bot ingress. `"none"` blocks bots except literally mentioning IDs listed in `DISCORD_PEER_BOT_IDS`. With dynamic peer routing disabled and no peer allowlist configured, `"mentions"` accepts explicitly mentioning bot authors and `"all"` accepts all bot messages. |
 | `DISCORD_REACTIONS` | No | `true` | When `true`, the bot adds emoji reactions to messages during processing (👀 when starting, ✅ on success, ❌ on error). Set to `false` to disable reactions entirely. |
 | `DISCORD_IGNORED_CHANNELS` | No | — | Comma-separated channel IDs where the bot **never** responds, even when `@mentioned`. Takes priority over all other channel settings. |
 | `DISCORD_ALLOWED_CHANNELS` | No | — | Comma-separated channel IDs. When set, the bot **only** responds in these channels (plus DMs if allowed). Overrides `config.yaml` `discord.allowed_channels`. Combine with `DISCORD_IGNORED_CHANNELS` to express allow/deny rules. |
@@ -325,7 +325,7 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS` | No | `2.0` | Delay between split chunks when a single message exceeds Discord's length limit. |
 
 :::warning Multi-agent mode must be explicitly constrained
-Do not use `DISCORD_ALLOW_BOTS=all` for agent collaboration. Use `mentions`, enable `bots_require_inline_mention` and `dynamic_thread_mentions`, and list every trusted peer in `peer_bot_ids`. This prevents automatic Discord reply pings from waking an agent and keeps untrusted bots out of the agent plane.
+Do not use `DISCORD_ALLOW_BOTS=all` for agent collaboration. Keep it at `none`, enable `dynamic_thread_mentions`, and list every trusted peer in `peer_bot_ids`. A trusted peer is admitted only when its message contains this bot's literal user mention. This prevents automatic Discord reply pings from waking an agent and keeps untrusted bots out of the agent plane. Broad `allow_bots` modes apply only when dynamic peer routing is disabled and no peer allowlist is configured.
 :::
 
 ### Config File (`config.yaml`)
@@ -341,7 +341,7 @@ discord:
   dynamic_thread_mentions: false # Solo ambient follow-ups; explicit addressing after a trusted peer joins
   dynamic_thread_history_limit: 5000 # Bounded cold-start trusted-peer scan; saturation fails closed
   peer_bot_ids: []                # Trusted Discord bot user IDs
-  allow_bots: none                # Set to mentions for trusted visible bot handoffs
+  allow_bots: none                # Trusted peers with literal mentions bypass this broad bot gate
   bots_require_inline_mention: false # Require literal inline mentions from bot authors
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention

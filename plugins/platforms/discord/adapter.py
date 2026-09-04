@@ -1319,13 +1319,18 @@ class DiscordAdapter(BasePlatformAdapter):
         role_authorized = False
         if getattr(message.author, "bot", False):
             peer_bot_ids = self._discord_peer_bot_ids()
+            author_id = str(message.author.id)
             if (
                 self._discord_dynamic_thread_mentions() or peer_bot_ids
-            ) and str(message.author.id) not in peer_bot_ids:
+            ) and author_id not in peer_bot_ids:
                 return False, False
             self._observe_dynamic_thread_peer(message)
+            explicitly_mentioned_trusted_peer = (
+                author_id in peer_bot_ids
+                and self._self_is_raw_mentioned(message)
+            )
             allow_bots = self._get_allow_bots()
-            if allow_bots == "none":
+            if allow_bots == "none" and not explicitly_mentioned_trusted_peer:
                 return False, False
             if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
                 return False, False
@@ -1334,6 +1339,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._self_is_raw_mentioned(message)
             ):
                 return False, False
+            # The gateway cannot independently re-check Discord's raw mention
+            # token. Carry the adapter's narrow peer authorization through the
+            # second authorization gate instead of requiring broad bot ingress.
+            role_authorized = explicitly_mentioned_trusted_peer
         else:
             msg_guild = getattr(message, "guild", None)
             is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None

@@ -133,6 +133,17 @@ def test_discord_bot_NOT_authorized_when_allow_bots_unset(monkeypatch):
     assert runner._is_user_authorized(source) is False
 
 
+def test_adapter_authorized_trusted_peer_bypasses_global_bot_block(monkeypatch):
+    """A Discord adapter may narrowly preauthorize an explicitly mentioned peer."""
+    runner = _make_bare_runner()
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "100200300")
+    source = _make_discord_bot_source(bot_id="999888777")
+    source.role_authorized = True
+
+    assert runner._is_user_authorized(source) is True
+
+
 def test_discord_human_still_checked_against_allowlist_when_bot_policy_set(monkeypatch):
     """DISCORD_ALLOW_BOTS=all must NOT open the gate for humans — they
     still need to be in DISCORD_ALLOWED_USERS (or a pairing approval).
