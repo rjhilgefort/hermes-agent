@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+import asyncio
 import os
 import sys
 
@@ -118,6 +119,10 @@ def adapter(monkeypatch):
         "DISCORD_HISTORY_BACKFILL",
         "DISCORD_HISTORY_BACKFILL_LIMIT",
         "DISCORD_ALLOW_BOTS",
+        "DISCORD_ALLOW_ALL_USERS",
+        "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
+        "DISCORD_DYNAMIC_THREAD_MENTIONS",
+        "DISCORD_PEER_BOT_IDS",
     ):
         monkeypatch.delenv(_var, raising=False)
 
@@ -193,6 +198,23 @@ class FakeHistoryChannel(FakeTextChannel):
             and (after_id is None or int(message.id) > after_id)
         ]
         messages.sort(key=lambda message: int(message.id), reverse=not oldest_first)
+
+        async def _iter():
+            for message in messages[:limit]:
+                yield message
+
+        return _iter()
+
+
+class FakeHistoryThread(FakeThread):
+    def __init__(self, history_messages, **kwargs):
+        super().__init__(**kwargs)
+        self._history_messages = list(history_messages)
+
+    def history(self, *, limit, before, after=None, oldest_first=None):
+        before_id = int(getattr(before, "id", before))
+        messages = [m for m in self._history_messages if int(m.id) < before_id]
+        messages.sort(key=lambda m: int(m.id), reverse=True)
 
         async def _iter():
             for message in messages[:limit]:
@@ -885,6 +907,477 @@ def test_discord_thread_mention_free_users_yaml_bridge(monkeypatch):
     )
 
     assert os.environ["DISCORD_THREAD_MENTION_FREE_USERS"] == "42,99"
+
+
+def _enable_dynamic(adapter, peer_ids=("111",)):
+    adapter.config.extra.update(
+        {
+            "dynamic_thread_mentions": True,
+            "peer_bot_ids": list(peer_ids),
+            "allow_bots": "mentions",
+            "bots_require_inline_mention": True,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_dynamic_thread_keeps_solo_bot_ambient(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    _enable_dynamic(adapter)
+    thread = FakeThread(channel_id=2001)
+    adapter._threads.mark("2001")
+
+    await adapter._handle_message(make_message(channel=thread, content="solo follow-up"))
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_authorized_human_peer_invitation_silences_ambient(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    _enable_dynamic(adapter)
+    thread = FakeThread(channel_id=2002)
+    adapter._threads.mark("2002")
+    peer = SimpleNamespace(id=111, bot=True, display_name="Hound", name="Hound")
+    invitation = make_message(
+        channel=thread,
+        content="<@111> join",
+        mentions=[peer],
+    )
+
+    admitted, _ = adapter._discord_message_admission(invitation, claim=False)
+    assert admitted is False
+    assert "2002" in adapter._multi_agent_threads
+
+    await adapter._handle_message(make_message(channel=thread, content="ambient"))
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_denied_human_cannot_poison_dynamic_thread(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "9999")
+    monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+    _enable_dynamic(adapter)
+    peer = SimpleNamespace(id=111, bot=True, display_name="Hound", name="Hound")
+    invitation = make_message(
+        channel=FakeThread(channel_id=2003),
+        content="<@111> join",
+        mentions=[peer],
+    )
+
+    admitted, _ = adapter._discord_message_admission(invitation, claim=False)
+
+    assert admitted is False
+    assert "2003" not in adapter._multi_agent_threads
+
+
+def test_untrusted_bot_is_rejected_even_with_literal_mention(adapter):
+    _enable_dynamic(adapter)
+    bot_user = adapter._client.user
+    bot_user.bot = True
+    message = make_message(
+        channel=FakeThread(channel_id=2004),
+        content=f"<@{bot_user.id}> run",
+        mentions=[bot_user],
+        author_id=222,
+        author_bot=True,
+    )
+
+    admitted, _ = adapter._discord_message_admission(message, claim=False)
+
+    assert admitted is False
+    assert "2004" not in adapter._multi_agent_threads
+
+
+def test_dynamic_mode_with_empty_allowlist_rejects_all_bots(adapter):
+    _enable_dynamic(adapter, peer_ids=())
+    bot_user = adapter._client.user
+    bot_user.bot = True
+    message = make_message(
+        channel=FakeThread(channel_id=2005),
+        content=f"<@{bot_user.id}> run",
+        mentions=[bot_user],
+        author_id=222,
+        author_bot=True,
+    )
+
+    admitted, _ = adapter._discord_message_admission(message, claim=False)
+
+    assert admitted is False
+
+
+def test_trusted_bot_requires_literal_inline_mention(adapter):
+    _enable_dynamic(adapter)
+    message = make_message(
+        channel=FakeThread(channel_id=2006),
+        content="reply chip only",
+        mentions=[adapter._client.user],
+        author_id=111,
+        author_bot=True,
+    )
+
+    admitted, _ = adapter._discord_message_admission(message, claim=False)
+
+    assert admitted is False
+    assert "2006" in adapter._multi_agent_threads
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_thread_routes_direct_human_reply(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    _enable_dynamic(adapter)
+    thread = FakeThread(channel_id=2007)
+    adapter._threads.mark("2007")
+    adapter._multi_agent_threads.mark("2007")
+    message = make_message(channel=thread, content="production")
+    message.type = discord_platform.discord.MessageType.reply
+    message.reference = SimpleNamespace(
+        message_id=999,
+        resolved=SimpleNamespace(
+            id=999,
+            author=adapter._client.user,
+            content="Which environment?",
+            attachments=[],
+        ),
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_overrides_free_response_and_global_mention_off(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "*")
+    _enable_dynamic(adapter)
+    thread = FakeThread(channel_id=2008)
+    adapter._threads.mark("2008")
+    adapter._multi_agent_threads.mark("2008")
+
+    await adapter._handle_message(make_message(channel=thread, content="ambient"))
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_history_recovers_trusted_bot(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    _enable_dynamic(adapter)
+    peer = SimpleNamespace(id=111, bot=True, display_name="Hound", name="Hound")
+    thread = FakeHistoryThread(
+        [make_history_message(author=peer, content="prior peer output", msg_id=122)],
+        channel_id=2009,
+    )
+    adapter._threads.mark("2009")
+
+    await adapter._handle_message(make_message(channel=thread, content="ambient"))
+
+    assert "2009" in adapter._multi_agent_threads
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_history_recovers_authorized_human_invitation(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    _enable_dynamic(adapter)
+    human = SimpleNamespace(id=42, bot=False, display_name="Rob", name="Rob")
+    thread = FakeHistoryThread(
+        [make_history_message(author=human, content="<@111> join", msg_id=122)],
+        channel_id=2014,
+    )
+    adapter._threads.mark("2014")
+
+    await adapter._handle_message(make_message(channel=thread, content="ambient"))
+
+    assert "2014" in adapter._multi_agent_threads
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_thread_accepts_explicit_target_after_peer_joins(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    _enable_dynamic(adapter)
+    thread = FakeThread(channel_id=2015)
+    adapter._threads.mark("2015")
+    adapter._multi_agent_threads.mark("2015")
+    bot_user = adapter._client.user
+    message = make_message(
+        channel=thread,
+        content=f"<@{bot_user.id}> your turn",
+        mentions=[bot_user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recovered_multi_agent_thread_routes_direct_reply(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    _enable_dynamic(adapter)
+    thread = FakeThread(channel_id=2016)
+    adapter._threads.mark("2016")
+    adapter._multi_agent_threads.mark("2016")
+    adapter._dynamic_thread_history_checked.add("2016")
+    message = make_message(channel=thread, content="production")
+    message.type = discord_platform.discord.MessageType.reply
+    message.reference = SimpleNamespace(
+        message_id=999,
+        resolved=SimpleNamespace(
+            id=999,
+            author=adapter._client.user,
+            content="Which environment?",
+            attachments=[],
+        ),
+    )
+
+    dispatched = await adapter._dispatch_recovered_message(message)
+
+    assert dispatched is True
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_history_truncated_page_fails_closed(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    _enable_dynamic(adapter)
+    adapter.config.extra["history_backfill_limit"] = 2
+    human = SimpleNamespace(id=42, bot=False, display_name="Rob", name="Rob")
+    thread = FakeHistoryThread(
+        [
+            make_history_message(author=human, content="recent one", msg_id=122),
+            make_history_message(author=human, content="recent two", msg_id=121),
+        ],
+        channel_id=2018,
+    )
+    adapter._threads.mark("2018")
+
+    await adapter._handle_message(make_message(channel=thread, content="ambient"))
+
+    assert "2018" in adapter._multi_agent_threads
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_denied_recovered_message_cannot_mutate_dynamic_state(adapter):
+    _enable_dynamic(adapter)
+    adapter._allowed_user_ids = {"9999"}
+
+    class FailingThread(FakeThread):
+        def history(self, **kwargs):
+            raise RuntimeError("history unavailable")
+
+    thread = FailingThread(channel_id=2019)
+    adapter._threads.mark("2019")
+    dispatched = await adapter._dispatch_recovered_message(
+        make_message(channel=thread, content="ambient", author_id=42)
+    )
+
+    assert dispatched is False
+    assert "2019" not in adapter._multi_agent_threads
+
+
+@pytest.mark.asyncio
+async def test_dynamic_history_failure_fails_closed(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    _enable_dynamic(adapter)
+
+    class FailingThread(FakeThread):
+        def history(self, **kwargs):
+            raise RuntimeError("history unavailable")
+
+    thread = FailingThread(channel_id=2010)
+    adapter._threads.mark("2010")
+
+    await adapter._handle_message(make_message(channel=thread, content="ambient"))
+
+    assert "2010" in adapter._multi_agent_threads
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dynamic_recovery_waits_for_one_scan(adapter):
+    _enable_dynamic(adapter)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    peer = SimpleNamespace(id=111, bot=True, display_name="Hound", name="Hound")
+
+    class BlockingThread(FakeThread):
+        def history(self, **kwargs):
+            async def _iter():
+                started.set()
+                await release.wait()
+                yield make_history_message(author=peer, content="peer", msg_id=122)
+            return _iter()
+
+    thread = BlockingThread(channel_id=2011)
+    adapter._threads.mark("2011")
+    message = make_message(channel=thread, content="ambient")
+    first = asyncio.create_task(adapter._recover_dynamic_thread_peer_from_history(message, "2011"))
+    await started.wait()
+    second = asyncio.create_task(adapter._recover_dynamic_thread_peer_from_history(message, "2011"))
+    await asyncio.sleep(0)
+    assert second.done() is False
+    release.set()
+    await asyncio.gather(first, second)
+    assert "2011" in adapter._multi_agent_threads
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dynamic_recovery_fails_closed_for_waiters(adapter):
+    _enable_dynamic(adapter)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingThread(FakeThread):
+        def history(self, **kwargs):
+            async def _iter():
+                started.set()
+                await release.wait()
+                if False:
+                    yield None
+            return _iter()
+
+    thread = BlockingThread(channel_id=2012)
+    adapter._threads.mark("2012")
+    message = make_message(channel=thread, content="ambient")
+    first = asyncio.create_task(adapter._recover_dynamic_thread_peer_from_history(message, "2012"))
+    await started.wait()
+    second = asyncio.create_task(adapter._recover_dynamic_thread_peer_from_history(message, "2012"))
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await second
+    assert "2012" in adapter._multi_agent_threads
+
+
+@pytest.mark.asyncio
+async def test_send_marks_visible_peer_handoff(adapter):
+    _enable_dynamic(adapter)
+
+    class SendingThread(FakeThread):
+        async def send(self, content, reference=None):
+            return SimpleNamespace(id=222)
+
+    thread = SendingThread(channel_id=2013)
+    adapter._client = SimpleNamespace(
+        user=adapter._client.user,
+        get_channel=lambda channel_id: thread if channel_id == 2013 else None,
+        fetch_channel=AsyncMock(return_value=thread),
+    )
+
+    result = await adapter.send("2013", "<@111> please inspect")
+
+    assert result.success is True
+    assert "2013" in adapter._multi_agent_threads
+
+
+@pytest.mark.asyncio
+async def test_send_marks_handoff_after_first_successful_chunk(adapter):
+    _enable_dynamic(adapter)
+
+    class PartiallyFailingThread(FakeThread):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.calls = 0
+
+        async def send(self, content, reference=None):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("second chunk failed")
+            return SimpleNamespace(id=223)
+
+    thread = PartiallyFailingThread(channel_id=2017)
+    adapter._client = SimpleNamespace(
+        user=adapter._client.user,
+        get_channel=lambda channel_id: thread if channel_id == 2017 else None,
+        fetch_channel=AsyncMock(return_value=thread),
+    )
+    adapter.truncate_message = MagicMock(
+        return_value=["<@111> please inspect", "second chunk"]
+    )
+
+    result = await adapter.send("2017", "ignored")
+
+    assert result.success is False
+    assert "2017" in adapter._multi_agent_threads
+
+
+def test_dynamic_yaml_bridge_and_peer_id_normalization(adapter, monkeypatch):
+    for key in (
+        "DISCORD_ALLOW_BOTS",
+        "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
+        "DISCORD_DYNAMIC_THREAD_MENTIONS",
+        "DISCORD_PEER_BOT_IDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    seeded = _apply_yaml_config(
+        {},
+        {
+            "allow_bots": "mentions",
+            "bots_require_inline_mention": True,
+            "dynamic_thread_mentions": True,
+            "peer_bot_ids": ["111", "<@222>", "user:333", "not-a-name"],
+        },
+    )
+    adapter.config.extra.update(seeded or {})
+
+    assert adapter._get_allow_bots() == "mentions"
+    assert adapter._discord_bots_require_inline_mention() is True
+    assert adapter._discord_dynamic_thread_mentions() is True
+    assert adapter._discord_peer_bot_ids() == {"111", "222", "333"}
+
+
+def test_dynamic_yaml_bridge_preserves_environment_precedence(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "mentions")
+    monkeypatch.setenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_DYNAMIC_THREAD_MENTIONS", "true")
+    monkeypatch.setenv("DISCORD_PEER_BOT_IDS", "222")
+
+    seeded = _apply_yaml_config(
+        {},
+        {
+            "allow_bots": "none",
+            "bots_require_inline_mention": False,
+            "dynamic_thread_mentions": False,
+            "peer_bot_ids": ["111"],
+        },
+    )
+    adapter.config.extra.update(seeded or {})
+
+    assert adapter._get_allow_bots() == "mentions"
+    assert adapter._discord_bots_require_inline_mention() is True
+    assert adapter._discord_dynamic_thread_mentions() is True
+    assert adapter._discord_peer_bot_ids() == {"222"}
+
+
+@pytest.mark.asyncio
+async def test_strict_thread_mention_policy_rejects_direct_reply_when_dynamic_off(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    thread = FakeThread(channel_id=2020)
+    adapter._threads.mark("2020")
+    message = make_message(channel=thread, content="reply without mention")
+    message.type = discord_platform.discord.MessageType.reply
+    message.reference = SimpleNamespace(
+        message_id=999,
+        resolved=SimpleNamespace(
+            id=999,
+            author=adapter._client.user,
+            content="prior bot message",
+            attachments=[],
+        ),
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -2619,6 +2619,9 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
+        "dynamic_thread_mentions": False,  # Solo bot gets ambient follow-ups; trusted peer participation switches the thread to explicit addressing
+        "peer_bot_ids": [],              # Discord bot user IDs trusted for visible bot-to-bot handoffs
+        "allow_bots": "none",           # none | mentions | all; use mentions for trusted visible bot handoffs
         "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
@@ -9018,7 +9021,15 @@ def set_config_value(key: str, value: str, force: bool = False):
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
+    default_value = _default_value_for_key(key)
+    if isinstance(default_value, (list, dict)):
+        try:
+            parsed_value = fast_safe_load(value)
+        except Exception:
+            parsed_value = value
+        if isinstance(parsed_value, type(default_value)):
+            coerced_value = parsed_value
+    elif not isinstance(default_value, str):
         if value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:

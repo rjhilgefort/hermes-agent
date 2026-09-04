@@ -924,6 +924,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # start as a one-on-one conversation without staying ambient once
         # another person joins the discussion.
         self._shared_human_threads = ThreadParticipationTracker("discord-shared-human")
+        # Persist trusted-peer participation separately from the existing
+        # RobBot/Ally human-participant tracker.
+        self._multi_agent_threads = ThreadParticipationTracker("discord_multi_agent")
+        self._dynamic_thread_history_checked: set[str] = set()
+        self._dynamic_thread_history_locks: dict[str, asyncio.Lock] = {}
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -1313,7 +1318,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
         role_authorized = False
         if getattr(message.author, "bot", False):
-            allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+            peer_bot_ids = self._discord_peer_bot_ids()
+            if (
+                self._discord_dynamic_thread_mentions() or peer_bot_ids
+            ) and str(message.author.id) not in peer_bot_ids:
+                return False, False
+            self._observe_dynamic_thread_peer(message)
+            allow_bots = self._get_allow_bots()
             if allow_bots == "none":
                 return False, False
             if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
@@ -1342,6 +1353,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._warn_if_fail_closed_default()
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
+            # Only an authorized human may persist a trusted-peer invitation.
+            self._observe_dynamic_thread_peer(message)
 
         raw_self_mention = self._self_is_explicitly_mentioned(message)
         if not isinstance(message.channel, discord.DMChannel) and (
@@ -2167,7 +2180,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
+        admitted, role_authorized = self._discord_message_admission(
+            message, claim=False,
+        )
+        if not admitted:
+            return False
         if not isinstance(message.channel, discord.DMChannel):
+            thread_id = (
+                str(message.channel.id)
+                if isinstance(message.channel, discord.Thread)
+                else None
+            )
+            if thread_id:
+                await self._recover_dynamic_thread_peer_from_history(message, thread_id)
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
             free_channels = self._discord_free_response_channels()
@@ -2178,19 +2203,25 @@ class DiscordAdapter(BasePlatformAdapter):
                     str(message.channel.id),
                 )
             )
+            direct_reply_target = bool(
+                self._discord_thread_requires_explicit_address(thread_id)
+                and self._reply_targets_self(message)
+            )
+            if (
+                self._discord_thread_requires_explicit_address(thread_id)
+                and not self._self_is_explicitly_mentioned(message)
+                and not direct_reply_target
+            ):
+                return False
             if (
                 self._discord_require_mention()
                 and "*" not in free_channels
                 and not (channel_keys & free_channels)
                 and not in_bot_thread
                 and not self._self_is_explicitly_mentioned(message)
+                and not direct_reply_target
             ):
                 return False
-        admitted, role_authorized = self._discord_message_admission(
-            message, claim=False,
-        )
-        if not admitted:
-            return False
         return await self._handle_message(
             message,
             role_authorized=role_authorized,
@@ -2907,6 +2938,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
+            effective_thread_id = thread_id
+            if effective_thread_id is None and isinstance(
+                channel, getattr(discord, "Thread", ())
+            ):
+                effective_thread_id = str(channel.id)
+
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
@@ -2971,6 +3008,16 @@ class DiscordAdapter(BasePlatformAdapter):
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                if (
+                    effective_thread_id
+                    and self._discord_dynamic_thread_mentions()
+                    and self._discord_peer_bot_ids()
+                    & {
+                        match.group(1)
+                        for match in re.finditer(r"<@!?(\d+)>", chunk)
+                    }
+                ):
+                    self._multi_agent_threads.mark(str(effective_thread_id))
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
@@ -5758,6 +5805,15 @@ class DiscordAdapter(BasePlatformAdapter):
             and getattr(att, "waveform", None) is not None
         )
 
+    def _get_allow_bots(self) -> str:
+        """Return the per-profile bot policy, failing closed if invalid."""
+        configured = self.config.extra.get("allow_bots")
+        raw = configured if configured is not None else os.getenv(
+            "DISCORD_ALLOW_BOTS", "none"
+        )
+        mode = str(raw).lower().strip() or "none"
+        return mode if mode in {"none", "mentions", "all"} else "none"
+
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs/names where no bot mention is required.
 
@@ -5832,6 +5888,15 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
 
+    def _reply_targets_self(self, message: Any) -> bool:
+        """Return True when a Discord reply directly targets this bot."""
+        if not self._client or not self._client.user:
+            return False
+        reference = getattr(message, "reference", None)
+        resolved = getattr(reference, "resolved", None)
+        author = getattr(resolved, "author", None)
+        return str(getattr(author, "id", "")) == str(self._client.user.id)
+
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
 
@@ -5857,6 +5922,125 @@ class DiscordAdapter(BasePlatformAdapter):
             "yes",
             "on",
         }
+
+    def _discord_dynamic_thread_mentions(self) -> bool:
+        """Whether trusted-peer participation dynamically mention-gates threads."""
+        configured = self.config.extra.get("dynamic_thread_mentions")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("DISCORD_DYNAMIC_THREAD_MENTIONS", "false").lower() in {
+            "true", "1", "yes", "on"
+        }
+
+    def _discord_peer_bot_ids(self) -> set[str]:
+        """Return Discord bot IDs trusted for visible handoffs."""
+        raw = self.config.extra.get("peer_bot_ids")
+        if raw is None:
+            raw = os.getenv("DISCORD_PEER_BOT_IDS", "")
+        values = raw if isinstance(raw, (list, tuple, set)) else str(raw or "").split(",")
+        cleaned = {_clean_discord_id(str(value)) for value in values}
+        return {value for value in cleaned if value.isdigit()}
+
+    def _observe_dynamic_thread_peer(self, message: Any) -> None:
+        """Persist trusted-peer participation in a Discord thread."""
+        if not self._discord_dynamic_thread_mentions():
+            return
+        channel = getattr(message, "channel", None)
+        if not isinstance(channel, getattr(discord, "Thread", ())):
+            return
+        peer_ids = self._discord_peer_bot_ids()
+        if not peer_ids:
+            return
+        author = getattr(message, "author", None)
+        author_id = str(getattr(author, "id", ""))
+        peer_mentions = self._raw_mentioned_user_ids(message) & peer_ids
+        if (getattr(author, "bot", False) and author_id in peer_ids) or peer_mentions:
+            self._multi_agent_threads.mark(str(getattr(channel, "id", "")))
+
+    def _discord_thread_requires_explicit_address(
+        self, thread_id: Optional[str]
+    ) -> bool:
+        """Return True after a trusted peer joins the thread."""
+        return bool(
+            thread_id
+            and self._discord_dynamic_thread_mentions()
+            and thread_id in self._multi_agent_threads
+        )
+
+    async def _recover_dynamic_thread_peer_from_history(
+        self, message: Any, thread_id: str
+    ) -> None:
+        """Recover peer participation after a cold start, failing closed."""
+        if (
+            not self._discord_dynamic_thread_mentions()
+            or thread_id in self._multi_agent_threads
+        ):
+            return
+        if thread_id not in self._threads and not self._self_is_explicitly_mentioned(message):
+            return
+        peer_ids = self._discord_peer_bot_ids()
+        if not peer_ids:
+            return
+        lock = self._dynamic_thread_history_locks.setdefault(thread_id, asyncio.Lock())
+        async with lock:
+            if (
+                thread_id in self._multi_agent_threads
+                or thread_id in self._dynamic_thread_history_checked
+            ):
+                return
+            self._dynamic_thread_history_checked.add(thread_id)
+            try:
+                scan_limit = self._discord_history_backfill_limit()
+                scanned = 0
+                history = message.channel.history(
+                    limit=scan_limit,
+                    before=message,
+                    oldest_first=False,
+                )
+                async for prior in history:
+                    scanned += 1
+                    author = getattr(prior, "author", None)
+                    author_id = str(getattr(author, "id", ""))
+                    if getattr(author, "bot", False) and author_id in peer_ids:
+                        self._multi_agent_threads.mark(thread_id)
+                        return
+                    if getattr(author, "bot", False):
+                        continue
+                    if not (self._raw_mentioned_user_ids(prior) & peer_ids):
+                        continue
+                    parent_id = self._get_parent_channel_id(message.channel)
+                    channel_ids = {thread_id}
+                    if parent_id:
+                        channel_ids.add(parent_id)
+                    if self._is_allowed_user(
+                        author_id,
+                        author,
+                        guild=getattr(message, "guild", None),
+                        is_dm=False,
+                        channel_ids=channel_ids,
+                    ):
+                        self._multi_agent_threads.mark(thread_id)
+                        return
+                # A full page does not prove that older history lacks a peer.
+                # Fail closed rather than treating a truncated scan as complete.
+                if scan_limit <= 0 or scanned >= scan_limit:
+                    self._multi_agent_threads.mark(thread_id)
+            except asyncio.CancelledError:
+                self._multi_agent_threads.mark(thread_id)
+                logger.warning(
+                    "Discord: peer recovery cancelled for thread %s; requiring explicit addressing",
+                    thread_id,
+                )
+                raise
+            except Exception as exc:
+                self._multi_agent_threads.mark(thread_id)
+                logger.warning(
+                    "Discord: unable to recover peer participation for thread %s; requiring explicit addressing: %s",
+                    thread_id,
+                    exc,
+                )
 
     def _discord_channel_keys(self, message: Any, parent_channel_id: Optional[str] = None) -> set[str]:
         """Return channel identifiers accepted by Discord channel config gates.
@@ -5967,6 +6151,7 @@ class DiscordAdapter(BasePlatformAdapter):
             not thread_id
             or thread_id not in self._threads
             or self._discord_thread_require_mention()
+            or self._discord_thread_requires_explicit_address(thread_id)
         ):
             return False
 
@@ -7218,6 +7403,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if is_thread:
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
+            await self._recover_dynamic_thread_peer_from_history(message, thread_id)
 
         is_voice_linked_channel = False
 
@@ -7290,8 +7476,27 @@ class DiscordAdapter(BasePlatformAdapter):
                 thread_id,
             )
 
+            direct_reply_target = bool(
+                self._discord_thread_requires_explicit_address(thread_id)
+                and self._reply_targets_self(message)
+            )
+
+            # Multi-agent mode overrides free-response channels and a globally
+            # disabled mention requirement. Only a literal mention or direct
+            # human reply may target this bot after a trusted peer joins.
+            if (
+                self._discord_thread_requires_explicit_address(thread_id)
+                and not self._self_is_explicitly_mentioned(message)
+                and not direct_reply_target
+            ):
+                return False
+
             if require_mention and not is_free_channel and not in_bot_thread:
-                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+                if (
+                    not self._self_is_explicitly_mentioned(message)
+                    and not direct_reply_target
+                    and not mention_prefix
+                ):
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
@@ -9466,8 +9671,6 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if isinstance(thread_users, list):
             thread_users = ",".join(str(value) for value in thread_users)
         os.environ["DISCORD_THREAD_MENTION_FREE_USERS"] = str(thread_users)
-    if "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
-        os.environ["DISCORD_BOTS_REQUIRE_INLINE_MENTION"] = str(discord_cfg["bots_require_inline_mention"]).lower()
     platforms_cfg = yaml_cfg.get("platforms")
     platform_extra_cfg = {}
     if isinstance(platforms_cfg, dict):
@@ -9476,6 +9679,44 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             candidate_extra = discord_platform_cfg.get("extra")
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
+    seeded_extra = {}
+    allow_bots_cfg = (
+        discord_cfg["allow_bots"]
+        if "allow_bots" in discord_cfg
+        else platform_extra_cfg.get("allow_bots")
+    )
+    if allow_bots_cfg is not None:
+        allow_bots_mode = str(
+            os.getenv("DISCORD_ALLOW_BOTS") or allow_bots_cfg
+        ).lower().strip()
+        if allow_bots_mode not in {"none", "mentions", "all"}:
+            allow_bots_mode = "none"
+        seeded_extra["allow_bots"] = allow_bots_mode
+        if not os.getenv("DISCORD_ALLOW_BOTS"):
+            os.environ["DISCORD_ALLOW_BOTS"] = allow_bots_mode
+    for key, env_key in (
+        ("bots_require_inline_mention", "DISCORD_BOTS_REQUIRE_INLINE_MENTION"),
+        ("dynamic_thread_mentions", "DISCORD_DYNAMIC_THREAD_MENTIONS"),
+    ):
+        value = discord_cfg[key] if key in discord_cfg else platform_extra_cfg.get(key)
+        if value is not None:
+            seeded_extra[key] = os.getenv(env_key) or value
+            if not os.getenv(env_key):
+                os.environ[env_key] = str(value).lower()
+    peer_bot_ids_cfg = (
+        discord_cfg["peer_bot_ids"]
+        if "peer_bot_ids" in discord_cfg
+        else platform_extra_cfg.get("peer_bot_ids")
+    )
+    if peer_bot_ids_cfg is not None:
+        seeded_extra["peer_bot_ids"] = (
+            os.getenv("DISCORD_PEER_BOT_IDS") or peer_bot_ids_cfg
+        )
+        if not os.getenv("DISCORD_PEER_BOT_IDS"):
+            value = peer_bot_ids_cfg
+            if isinstance(value, (list, tuple, set)):
+                value = ",".join(str(item) for item in value)
+            os.environ["DISCORD_PEER_BOT_IDS"] = str(value)
     allowed_users_cfg = (
         discord_cfg["allow_from"] if "allow_from" in discord_cfg
         else platform_extra_cfg.get("allow_from")
@@ -9499,7 +9740,6 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
-    seeded_extra = {}
     backfill_cfg = discord_cfg.get("missed_message_backfill")
     if isinstance(backfill_cfg, dict):
         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)

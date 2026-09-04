@@ -5,6 +5,7 @@ import os
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from hermes_cli.config import set_config_value, config_command
 
@@ -107,6 +108,15 @@ class TestConfigYamlRouting:
         config = _read_config(_isolated_hermes_home)
         assert "docker" in config
         assert "terminal" not in _read_env(_isolated_hermes_home)
+
+    def test_list_typed_key_parses_flow_sequence(self, _isolated_hermes_home):
+        set_config_value(
+            "discord.peer_bot_ids",
+            '["1544755047202558034"]',
+        )
+
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["discord"]["peer_bot_ids"] == ["1544755047202558034"]
 
     def test_terminal_image_goes_to_config(self, _isolated_hermes_home):
         """TERMINAL_DOCKER_IMAGE doesn't match _API_KEY or _TOKEN, so config.yaml."""
