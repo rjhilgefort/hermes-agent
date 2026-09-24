@@ -4113,6 +4113,16 @@ def _probe_codex_quota_restored(
                     worst_used = max(worst_used or 0.0, float(used))
             if worst_used is not None:
                 result = worst_used < 100.0
+            # Purchased/unlimited credits keep an account usable even when every
+            # plan window reads 100%.  The window gate above cannot see them, so
+            # a credits-backed account stays frozen behind a stale
+            # ``last_error_reset_at`` and Hermes refuses requests the upstream
+            # would happily serve.  Consult the same ``credits`` block /usage
+            # already surfaces (agent.account_usage._fetch_codex_account_usage).
+            if result is False:
+                credits = payload.get("credits") or {}
+                if credits.get("has_credits") or credits.get("unlimited"):
+                    result = True
         elif response.status_code == 429:
             result = False
     except Exception:
